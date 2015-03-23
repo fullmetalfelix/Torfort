@@ -1,0 +1,1918 @@
+!*** ****** Forcer Module ****** ***!
+!
+!   Description:
+!   It manages the tip-sample interaction forces. The starting point
+!   is ReadGridFile() which reads the forcefield grid parameters and then builds
+!   a 3D grid in the gridQ(:) arrays. There are also interpolation routines which are
+!   good to get the forces between the specified points. The tip doesn't spend all
+!   day jumping from grid point to grid point u know!?! Then you can read the forces
+!   to the main matrix ForceField using the ReadForceField() routine. The forces are supposed to
+!   die whenever you jump too far, i.e. above the highest grid point (zmax)!
+!
+module Forcer
+
+character*20 :: GridFile                  !the grid parameters filename
+integer :: pX,pY,pZ                       !number of grid points along each axis
+double precision :: xMin,xMax             !minimum and maximum X value
+double precision, allocatable :: gridX(:) !the grid points coordinates along X
+double precision :: yMin,yMax             !minimum and maximum Y value
+double precision, allocatable :: gridY(:) !the grid points coordinates along Y
+double precision :: zMin,zMax             !minimum and maximum Z value
+double precision, allocatable :: gridZ(:) !the grid points coordinates along Z
+double precision :: hx,hy,hz              !grid steps size
+
+integer :: xsymmetry = 1                  !symmetry along x axis (1->pacman , 2->mirror)
+integer :: ysymmetry = 1                  !symmetry along y axis (1->pacman , 2->mirror)
+integer :: Geometry = 1                   !Surface geometry (1->Uniform , 2->Step)
+double precision :: StepYPoint = 0.0d0    !the Y coord where the step is (last point on the topmost terrace)
+double precision :: StepHeight = 0.0d0    !the step heigh
+double precision :: StepBroad  = 0.0d0    !the step broadening (for an der Waals morphing)
+double precision :: GridFactor            !the unit of the grid
+
+character*20 :: ForceFile                               !the force field filename
+integer :: ForceFormat = 1                              !the forcefile format (1->ijkfxfyfz, 2->matrixform)
+double precision, allocatable :: ForceField(:,:,:,:)    !the force field values (xindex,yindex,zindex,component)
+
+
+integer :: InterpolMethod     !interpolation method: 1->Trilinear, 2->Splines, 3->NURBS
+double precision, allocatable :: TrilinXline(:,:,:,:,:)   !triliear interpolator storage (x,y,z,fieldcomponent,m or q)
+double precision, allocatable :: YSpline(:,:,:)           !y-splines parameter storage (x,y,z) (for the y component of the filed along y lines!!!
+double precision, allocatable :: ZSpline(:,:,:)           !z-splines parameter storage (x,y,z) (for the z component of the filed along z lines!!!
+
+double precision, allocatable :: xcoords(:),ycoords(:),zcoords(:)
+double precision, allocatable :: Pijk(:,:,:,:)            !NURBS control points
+double precision, allocatable :: usk(:),vsk(:),wsk(:)     !NURBS parameters vectors
+double precision, allocatable :: uk(:),vk(:),wk(:)        !NURBS knots vectors
+double precision, allocatable :: Nb(:)                    !NURBS basis functions
+double precision, allocatable :: Nb3(:,:)
+integer :: Order=3                                        !NURBS order
+
+Logical :: fNoise=.true.                !force noise switch
+double precision :: Temp=1.0d0          !system's temperature
+double precision :: SDF_z,SDF_y         !mormal noise variances
+
+integer, parameter :: RNDlen=100        !length of random numbers vector
+integer :: RNDc=101                     !cursor
+double precision :: RNDv(RNDlen)         !random numbers vector
+
+
+contains
+
+
+subroutine ForceInit()
+  implicit none
+  
+  write(*,*)
+  call ReadGridFile()
+  call GenerateRegularGrid()
+  
+  if(ForceFormat==2) then
+    call ReadForceField()
+  else
+    call ReadForceFieldSimple()
+  endif
+
+  call SetInterpol()
+
+
+end subroutine ForceInit
+
+
+
+
+subroutine CalcForce(x,f)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out) :: f(3)
+  double precision :: fy,fz,fr(3)
+  
+  Select case (InterpolMethod)
+  case (1)
+    call Trilinear(x,fr)
+    f=fr
+    goto 10
+  case (2)
+    call SplineY(x,fy)
+    call SplineZ(x,fz)
+    f(1)=0.0d0
+    f(2)=fy
+    f(3)=fz
+    goto 10
+  case (3)
+    call NURBS(x,fr)
+    f=fr
+    goto 10
+  end select
+  
+10  if(fNoise) call AddNoise(f)
+    return
+
+end subroutine CalcForce
+
+
+subroutine CalcVanDerWaals(p,vdw)
+  use cantilever
+  implicit none
+  double precision, intent(in) :: p(3)
+  double precision, intent(out) :: vdw
+  double precision :: vdWup=0.0d0,vdWdw=0.0d0
+  double precision :: pd(3)
+  
+  
+  if(Geometry==1) then        !if itz plain surface
+    
+    !*** van der Waals contribution (already in N) ***
+    vdW=(TipHamaker*TipRadius**2)*(1.0d0-sing)*(TipRadius*sing-p(3)*sing-TipRadius-p(3))
+    vdW=vdW/(6.0d0*(p(3)**2)*(TipRadius+p(3)-TipRadius*sing)**2)
+    vdW=vdW-(TipHamaker*tang*(p(3)*sing+TipRadius*sing+TipRadius*cos2g))/(6.0d0*cosg*(TipRadius+p(3)-TipRadius*sing)**2)
+    return
+    
+  elseif(Geometry==2) then    !if there is a step
+    
+    call CenterCursor(p,pd)   !center the cursor in the unit cell
+    pd(3)=p(3)+StepHeight
+    
+    !vdW interaction on the top terrace
+    vdWup=(TipHamaker*TipRadius**2)*(1.0d0-sing)*(TipRadius*sing-p(3)*sing-TipRadius-p(3))
+    vdWup=vdWup/(6.0d0*(p(3)**2)*(TipRadius+p(3)-TipRadius*sing)**2)
+    vdWup=vdWup-(TipHamaker*tang*(p(3)*sing+TipRadius*sing+TipRadius*cos2g))/(6.0d0*cosg*(TipRadius+p(3)-TipRadius*sing)**2)
+    
+    !vdW interaction on the lower terrace
+    vdWdw=(TipHamaker*TipRadius**2)*(1.0d0-sing)*(TipRadius*sing-pd(3)*sing-TipRadius-p(3))
+    vdWdw=vdWdw/(6.0d0*(pd(3)**2)*(TipRadius+pd(3)-TipRadius*sing)**2)
+    vdWdw=vdWdw-(TipHamaker*tang*(pd(3)*sing+TipRadius*sing+TipRadius*cos2g))/(6.0d0*cosg*(TipRadius+pd(3)-TipRadius*sing)**2)
+    
+    vdw=vdWup/(1.0d0+exp((pd(2)-StepYPoint)/StepBroad))+vdWdw/(1.0d0+exp(-(pd(2)-StepYPoint)/StepBroad))
+    
+    return
+    
+  endif
+  
+
+end subroutine CalcVanDerWaals
+
+
+
+subroutine AddNoise(f)
+  use cantilever
+  implicit none
+  double precision, intent(inout) :: f(3)
+
+  if(RNDc>RNDlen) then
+    RNDc=1
+    call FillRndVector()
+  endif
+
+  f(2)=f(2)+RNDv(RNDc)*SDF_y
+  f(3)=f(3)+RNDv(RNDc+1)*SDF_z
+
+  RNDc=RNDc+2
+  return
+end subroutine AddNoise
+
+
+!*** ****** Trilinear Interpolation ****** ***!
+!   Input variables:
+!   (DBL)x(3)         position where you want the force to be extrapolated (x,y,z)
+!
+!   Output variables:
+!   (DBL)force(3)     the extrapolated force in x (fx,fy,fz)
+!
+!   Description:
+!   this part of the code was written during some sort of trascendent inspiration
+!   so... 
+subroutine Trilinear(x,force)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out) :: force(3)
+  
+  integer :: idx(3),idd,i,j,k,c
+  double precision :: f11,f12,f21,f22,f31,f32, xs(3)
+  double precision :: fzEnd
+  
+  
+  
+  if(x(3)>zMax) then
+    force=0.0d0
+    !write(*,*)'z was ',x(3),'force will be zero!'
+    return
+  endif
+  
+
+  call CenterCursor(x,xs)   !center the vector in the unit cell
+  call FindIndex(xs,idx)    !find the containing gridbox indexes
+  
+  idd=idx(2)+1
+  if(idx(2)==pY) idd=1
+  
+  !if we are inside the box
+  if(idx(3)<pZ) then
+    do c=1,3      !loop over the components
+      f11=TrilinXline(idx(1),idx(2),idx(3),c,1)*xs(1) + TrilinXline(idx(1),idx(2),idx(3),c,2)
+      f12=TrilinXline(idx(1),idd,idx(3),c,1)*xs(1) + TrilinXline(idx(1),idd,idx(3),c,2)
+    
+      f31 = (xs(2)-gridY(idx(2)))*(f12-f11)/hy + f11
+    
+      f21=TrilinXline(idx(1),idx(2),idx(3)+1,c,1)*xs(1) + TrilinXline(idx(1),idx(2),idx(3)+1,c,2)
+      f22=TrilinXline(idx(1),idd,idx(3)+1,c,1)*xs(1) + TrilinXline(idx(1),idd,idx(3)+1,c,2)
+    
+      f32 = (xs(2)-gridY(idx(2)))*(f22-f21)/hy + f21
+    
+      force(c)=  (xs(3)-gridZ(idx(3)))*(f32-f31)/hz + f31
+    enddo
+  else
+    force=0.0d0   !if we are outside (tip too far) all forces are 0
+  endif  
+  
+  
+end subroutine Trilinear
+
+
+
+!*** ****** ZSpline Interpolation ****** ***!
+!   Input variables:
+!   (DBL)x(3)         position where you want the force to be extrapolated (x,y,z)
+!
+!   Output variables:
+!   (DBL)forceZ       the extrapolated z component of the force in x
+!
+!   Description:
+!   I thought that the Z component of the force should be calculated differently, as u can
+!   see. This works like the trilinear stuff but the precalc z-lines are splines. the force is
+!   dead when the tip is too far away! In between the z-splines the interpolation is (bi)linear... for
+!   people like me it is accurate enough!
+!
+subroutine SplineZ(x,forceZ)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out) :: forceZ
+  double precision :: xs(3),zs11,zs12,zs21,zs22,M,M2
+  double precision :: t, zs31,zs32
+  double precision :: xf,yf
+  integer :: idx(3),ix,iy,iz,i,j,k
+
+
+  !huge distance check
+  if(x(3)>zMax) then
+    forceZ=0.0d0
+    return
+  endif
+
+
+  call CenterCursor(x,xs)   !center the vector in the unit cell
+  call FindIndex(xs,idx)    !find the containing gridbox indexes
+
+  i=idx(1)
+  j=idx(2)
+  k=idx(3)
+  ix=idx(1)+1
+  iy=idx(2)+1
+  iz=idx(3)+1
+  
+  !periodic boudaries in x,y
+  if(idx(1)==pX) ix=1
+  
+  if(idx(2)==pY) iy=1
+  !*************************
+  
+
+  !evaluate the 4 bounding z-splines in z (xs(3)) and do some linear interps
+  t=xs(3)-GridZ(k)
+  
+  M=ZSpline(i,j,k)
+  M2=ZSpline(i,j,k+1)
+  zs11=ForceField(i,j,k,3)+ ( (ForceField(i,j,iz,3)-ForceField(i,j,k,3))/hz - hz*(M2+2.0d0*M)/6.0d0)*t
+  zs11=zs11+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hz)*t**3
+
+  M=ZSpline(ix,j,k)
+  M2=ZSpline(ix,j,k+1)
+  zs12=ForceField(ix,j,k,3)+ ( (ForceField(ix,j,iz,3)-ForceField(ix,j,k,3))/hz - hz*(M2+2.0d0*M)/6.0d0)*t
+  zs12=zs12+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hz)*t**3 
+  
+  zs31= zs11+ (xs(1)-gridX(i))*(zs12-zs11)/hx   !linear interpolation along x
+  
+  
+  M=ZSpline(i,iy,k)
+  M2=ZSpline(i,iy,k+1)
+  zs21=ForceField(i,iy,k,3)+ ( (ForceField(i,iy,iz,3)-ForceField(i,iy,k,3))/hz - hz*(M2+2.0d0*M)/6.0d0)*t
+  zs21=zs21+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hz)*t**3
+
+  M=ZSpline(ix,iy,k)
+  M2=ZSpline(ix,iy,k+1)
+  zs22=ForceField(ix,iy,k,3)+ ( (ForceField(ix,iy,iz,3)-ForceField(ix,iy,k,3))/hz - hz*(M2+2.0d0*M)/6.0d0)*t
+  zs22=zs22+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hz)*t**3
+  
+  zs32= zs21+ (xs(1)-gridX(i))*(zs22-zs21)/hx   !linear interpolation along x
+  
+  forceZ= zs31+(xs(2)-gridY(j))*(zs32-zs31)/hy
+  
+
+end subroutine SplineZ
+
+!*** ****** YSpline Interpolation ****** ***!
+!   Input variables:
+!   (DBL)x(3)         position where you want the force to be extrapolated (x,y,z)
+!
+!   Output variables:
+!   (DBL)forceY       the extrapolated y component of the force in x
+!
+!   Description:
+!   the same as before but with no starcraft cheatcode!
+!
+subroutine SplineY(x,forceY)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out) :: forceY
+  double precision :: xs(3),zs11,zs12,zs21,zs22,M,M2
+  double precision :: t, zs31,zs32
+  integer :: idx(3),ix,iy,iz,i,j,k
+
+
+  !huge distance check
+  if(x(3)>zMax) then
+    forceY=0.0d0
+    return
+  endif
+
+
+  call CenterCursor(x,xs)   !center the vector in the unit cell
+  call FindIndex(xs,idx)    !find the containing gridbox indexes
+
+  i=idx(1)
+  j=idx(2)
+  k=idx(3)
+  ix=idx(1)+1
+  iy=idx(2)+1
+  iz=idx(3)+1
+  
+  !periodic boudaries in x,y
+  if(idx(1)==pX) ix=1
+  
+  if(idx(2)==pY) iy=1
+  !*************************
+    
+  !evaluate the 4 bounding y-splines in y (xs(2)) and do some linear interps
+  
+  t=xs(2)-GridY(j)    !t value corresponding to the y coordinate of the extrapolation
+  
+  M=YSpline(i,j,k)
+  M2=YSpline(i,iy,k)
+  zs11=ForceField(i,j,k,2)+ ( (ForceField(i,iy,k,2)-ForceField(i,j,k,2))/hy - hy*(M2+2.0d0*M)/6.0d0)*t
+  zs11=zs11+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hy)*t**3
+
+  M=YSpline(ix,j,k)
+  M2=YSpline(ix,iy,k)
+  zs12=ForceField(ix,j,k,2)+ ( (ForceField(ix,iy,k,2)-ForceField(ix,j,k,2))/hy - hy*(M2+2.0d0*M)/6.0d0)*t
+  zs12=zs12+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hy)*t**3 
+  
+  zs31= zs11+ (xs(1)-gridX(i))*(zs12-zs11)/hx   !linear interpolation along x
+  
+  
+  M=YSpline(i,j,iz)
+  M2=YSpline(i,iy,iz)
+  zs21=ForceField(i,j,iz,2)+ ( (ForceField(i,iy,iz,2)-ForceField(i,j,iz,2))/hy - hy*(M2+2.0d0*M)/6.0d0)*t
+  zs21=zs21+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hy)*t**3
+
+  M=YSpline(ix,j,iz)
+  M2=YSpline(ix,iy,iz)
+  zs22=ForceField(ix,j,k,2)+ ( (ForceField(ix,iy,iz,2)-ForceField(ix,j,iz,2))/hy - hy*(M2+2.0d0*M)/6.0d0)*t
+  zs22=zs22+ 0.50d0*M*t**2 + (M2-M)/(6.0d0*hy)*t**3
+  
+  zs32= zs21+ (xs(1)-gridX(i))*(zs22-zs21)/hx   !linear interpolation along x
+  
+  forceY= zs31+(xs(3)-gridZ(k))*(zs32-zs31)/hz  !linear interpolation along z
+
+
+end subroutine SplineY
+
+!*** ****** Simple Fy gradient from splines ****** ***!
+!
+subroutine SplineYGrad(x,GradFY)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out) :: GradFY
+  double precision :: x2(3),f1,f2,dy=0.705e-10
+  
+  !find the force in the starting point
+  call SplineY(x,f1)
+  
+  x2=x
+  x2(2)=x(2)+dy
+  
+  call SplineY(x2,f2)
+  
+  GradFY=(f2-f1)/dy
+
+
+end subroutine SplineYGrad
+
+
+subroutine NURBS(x,force)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out):: force(3)
+  double precision :: xs(3),si(3),sj(3),sk(3)
+  double precision :: t(3)
+  integer :: i,j,k,ii,jj,kk,c,idx(3)
+  
+  force=0.0d0
+  si=0.0d0
+  sj=0.0d0
+  sk=0.0d0
+  !huge distance check
+  if(x(3)>zMax)    return
+  
+  call CenterCursor(x,xs)   !center the vector in the unit cell
+  t=0.0d0
+  idx=0
+  t(1)=(xs(1)-xmin)/(xmax-xmin)
+  t(2)=(xs(2)-ymin)/(ymax-ymin)
+  idx(1)=NURBSSpan(pX+1,t(1),uk)
+  idx(2)=NURBSSpan(pY+1,t(2),vk)
+  
+  !high accuracy t(3) finder
+  call NURBSBasis(idx(1),t(1),pX+1,uk)
+  Nb3(1,0:Order)=Nb(0:Order)
+  call NURBSBasis(idx(2),t(2),pY+1,vk)
+  Nb3(2,0:Order)=Nb(0:Order)
+  
+  t(3)= FindTz(xs(3)) !(xs(3)*1.0e10-0.10d0)/(20.10d0-0.10d0)
+  idx(3)=NURBSSpan(pZ,t(3),wk)
+  !write(*,*)'param for',xs(3),'is',t(3)
+  call NURBSBasis(idx(3),t(3),pZ,wk)
+  Nb3(3,0:Order)=Nb(0:Order)
+  
+!   write(*,*)xs(:),t(:),idx(:)
+  
+  do c=1,3
+    do i=0,Order
+      sj(c)=0.0d0
+      do j=0,Order
+        sk(c)=0.0d0
+        do k=0,Order
+          sk(c)=sk(c)+Nb3(3,k)*Pijk(idx(1)-Order+i,idx(2)-Order+j,idx(3)-Order+k,c)!zcoords(idx(3)-Order+k)!
+        enddo
+        sj(c)=sj(c)+Nb3(2,j)*sk(c)
+      enddo
+      force(c)=force(c)+Nb3(1,i)*sj(c)
+    enddo
+  enddo
+  
+  !write(*,*)force(:)
+  
+end subroutine NURBS
+
+
+double precision function FindTz(z)
+  implicit none
+  double precision, intent(in) :: z
+  double precision :: tl,tm,tr,t(3)
+  double precision :: lef,mid,rig
+  integer :: i,j,k,kk,side=0
+  
+  t=0.0d0
+  lef=0.0d0
+  rig=1.0d0
+  tl=zmin-z!NURBSxyz(t,3,.false.)-z
+  tr=zmax-z!NURBSxyz(t,3,.false.)-z
+  do
+    mid=(tl*rig-tr*lef)/(tl-tr)
+    !write(*,*)'pts',lef,rig,mid
+    !get the non zero basis functions in t
+    t(3)=mid
+    kk=NURBSSpan(pZ,mid,wk)
+    call NURBSBasis(kk,mid,pZ,wk)
+    Nb3(3,0:Order)=Nb(0:Order)
+    tm=NURBSxyz(t,3,.false.)-z
+    !write(*,*)'val',tl+z,tr+z,tm+z,Abs(tm)
+    if(tm*tr>0.0d0) then
+      rig=mid
+      tr=tm
+      if(side==-1) tl=tl/2.0d0
+      side=-1
+    endif
+    if(tl*tm>0.0d0) then
+      lef=mid
+      tl=tm
+      if(side==1) tr=tr/2.0d0
+      side=1
+    endif
+    
+    if(Abs(tm)<1.0e-15) exit
+    if(abs(rig-lef)<1.0e-8) exit
+  enddo
+  
+  FindTz=mid
+  return
+  
+end function FindTz
+
+subroutine dbgNURBSz()
+  implicit none
+  double precision :: x(3), f(3)
+  double precision :: z=0.0d0
+  integer :: i
+  
+  x=0.0d0
+  do z=20.12e-10,1.0e-10, -0.01e-10
+    x(3) = z
+    call NURBS(x,f)
+    write(123,*)z,f(3)
+    !write(*,*)z,f(3)
+  enddo
+  do i=1,pZ
+    write(124,*)GridZ(i),ForceField(1,1,i,3)
+  enddo
+  
+  
+end subroutine dbgNURBSz
+
+!*** ****** Find the containing grid box lower indexes *** ******!
+!   Input variables:
+!   (DBL)x(3)         the tip position, already reshifted in the unit cell
+!
+!   Output variables:
+!   (INT)idx(3)       the lower indexes of the grid volume containing x
+!
+!   Description:
+!   Killroy was here!
+!
+subroutine FindIndex(x,idx)
+  implicit none
+  double precision, intent(in) :: x(3)
+  integer, intent(out) :: idx(3)
+  integer :: i
+  
+  idx=0
+  
+  !*** x axis
+  if( (x(1)>=gridX(pX)) ) then
+    idx(1)=pX
+  else
+    do i=1,pX
+      if(gridX(i)>x(1)) then
+        idx(1)=i-1
+        exit
+      endif
+    enddo
+  endif
+  
+
+  
+  !*** ******
+    
+  !*** y axis
+  if( x(2)>=gridY(pY) ) then
+    idx(2)=pY
+  else
+    do i=1,pY
+      if(gridY(i)>x(2)) then
+        idx(2)=i-1
+        exit
+      endif
+    enddo 
+  endif
+
+  !*** ******
+
+  !*** z axis
+  if(x(3)<=zmin) then
+    idx(3)=1
+    return
+  endif
+  
+  if( x(3)>=gridZ(pZ) ) then
+    idx(3)=pZ
+  else
+    do i=1,pZ
+      !write(*,*)'comparing',x(3),'to',gridZ(i), (gridZ(i)>x(3))
+      if(gridZ(i)>x(3)) then
+        idx(3)=i-1
+        exit
+      endif
+    enddo 
+  endif
+  
+  
+
+end subroutine FindIndex
+
+
+subroutine CenterCursor(x,xc)
+  implicit none
+  double precision, intent(in) :: x(3)
+  double precision, intent(out) :: xc(3)
+  
+  
+  !center the cursor in the x direction
+  xc(1)=x(1)
+  if(xsymmetry==1)then
+    !the pacman symmetry
+    do
+      if((xc(1)>xMax).or.(xc(1)<0.0d0)) then 
+	xc(1)=xc(1)-(x(1)/Abs(x(1)))*xMax
+      else
+	exit
+      endif
+    enddo
+    
+  else
+    !mirror geometry
+    
+    if(xc(1)<0) xc(1)=-xc(1)      !if the point is in the negative side, flip it!
+    
+    do
+      if((xc(1)>=2.0d0*GridX(pX))) then
+        xc(1)=xc(1)-(2.0d0*GridX(pX))      !this centers the point in the range [0,2L]
+      else
+        if( xc(1)>GridX(pX) ) then
+          xc(1)=2.0d0*GridX(pX)-xc(1)
+	endif
+        exit
+      endif
+    enddo
+  endif
+  
+  !center the cursor in the y direction
+  xc(2)=x(2)
+  if(ysymmetry==1)then    !use the right symmetry fcs
+    !the pacman symmetry
+    do
+      if((xc(2)>yMax).or.(xc(2)<0.0d0)) then 
+	xc(2)=xc(2)-(x(2)/abs(x(2)))*yMax
+      else
+	exit
+      endif
+    enddo
+    
+  else
+    !the mirror symmetry
+    
+    if(xc(2)<0) xc(2)=-xc(2)      !if the point is in the negative side, flip it!
+    
+    do
+      if((xc(2)>=2.0d0*GridY(pY))) then
+        xc(2)=xc(2)-(2.0d0*GridY(pY))      !this centers the point in the range [0,2L]
+      else
+        if( xc(2)>GridY(pY) ) then
+          xc(2)=2.0d0*GridY(pY)-xc(2)
+	endif
+        exit
+      endif
+    enddo
+    
+  endif
+  
+ 
+  xc(3)=x(3)
+
+  return
+
+end subroutine CenterCursor
+
+
+!*** ****** Trilinear Interpolation SetUp ****** ***!
+!   Description:
+!   this stores in TrilinXline the line parameters for linear interpolation along the X lines of the force field.
+!   For each grid point (x,y,z,c) of indexes (i,j,k,c), TrilinXline(i,j,k,c,p) contains the line M (p=1) or Q (p=2)
+!   that interpolates the component c of force field from the point (i,j,k) to the point (i+1,j,k).
+!   precalculating these will save a lot of time later!
+!
+Subroutine TrilinearSetup()
+  implicit none
+  double precision :: m,q
+  double precision :: fB,fA,xA,dx
+  integer :: i,j,k,c
+  
+  write(*,'(A36)',advance='no') 'Precalculating trilinear factors...'
+  
+  allocate(TrilinXline(pX,pY,pZ,3,2))
+  
+  dx=xMax/pX
+  
+  do i=1,pX
+    do j=1,pY
+      do k=1,pZ
+      do c=1,3
+
+        !*** x component
+	fA=ForceField(i,j,k,c)
+	xA=gridX(i)
+	
+	if(i==pX) then
+          fB=ForceField(1,j,k,c)
+        else
+          fB=ForceField(i+1,j,k,c)
+        endif
+  
+        m = (fB-fA)/dx
+        q = fA - xA*m
+	
+        TrilinXline(i,j,k,c,1)=m
+        TrilinXline(i,j,k,c,2)=q
+	
+      enddo
+
+      enddo
+      
+    enddo
+  enddo
+  
+  write(*,*) 'done.'
+  
+  
+end Subroutine TrilinearSetup
+
+
+
+!*** ****** Y-Spline Interpolation SetUp ****** ***!
+!   Description:
+!   this routine calculates and stores the M parameters used to build the splines along y lines of the grid.
+!   The goal is to interpolate with splines the forcefield along these lines to have a better interpolation
+!   than the linear one. Only the Y component of the forcefield will be interpolated, the Z component
+!   will have itz own routine and will be interpolated separately.
+!   YSpline(x,y,z) contains the M coefficient used to build the spline in position (x,y,z).
+!   SPLINES FTW
+!
+subroutine YSplineSetup()
+  implicit none
+  integer :: i,j,k,info
+  double precision, allocatable :: b(:),diag(:),ld(:),ud(:)
+  
+  write(*,'(A)',advance='no')' Computing Y Splines parameters...'
+  
+  
+  allocate(YSpline(pX,pY,pZ))   !allocate the data container
+  allocate(b(pY-2),diag(pY-2),ld(pY-2),ud(pY-2))    !allocate the matrixs for spline solver
+  YSpline=0.0d0
+  
+  do i=1,pX     !loop on each x row
+    do k=1,pZ     !loop on each z plane
+    
+      !fill the B vector
+      do j=1,pY-2
+	b(j) = ForceField(i,j,k,2) -2.0d0*ForceField(i,j+1,k,2) + ForceField(i,j+2,k,2)    !ONLY THE Y COMPONENT OF THE FIELD!!!
+      enddo
+      b=6.0d0*b/(hy**2)
+      
+      !reset the tridiagonal matrix
+      diag=4.0d0      
+      ld=1.0d0
+      ud=1.0d0
+      
+      call dgtsl((pY-2), ld, diag, ud, b, info)   !solve the tridiag linear system
+      
+      !set the spline coeffs in a matrix
+      do j=1,pY-2
+	YSpline(i,j+1,k)=b(j)
+      enddo    
+    
+    enddo
+  enddo
+  !now we have the M parameters for all the Y lines to build the splines (ONLY FOR THE Y COMPONENT OF THE FIELD!!!
+
+  write(*,*)'done'
+
+
+end subroutine YSplineSetup
+
+!*** ****** Z-Spline Interpolation SetUp ****** ***!
+!   Description;
+!   like the previous one... change Y with Z lol!
+!
+subroutine ZSplineSetup()
+  use consts
+  implicit none
+  integer :: i,j,k,info
+  double precision, allocatable :: b(:),diag(:),ld(:),ud(:)
+  
+  
+  write(*,'(A)',advance='no')' Computing Z Splines parameters...'
+  
+    
+  allocate(ZSpline(pX,pY,pZ+1))   !allocate the data container
+  allocate(b(pZ-1),diag(pZ-1),ld(pZ-1),ud(pZ-1))    !allocate the matrixs for spline solver
+  ZSpline=0.0d0
+  
+  do i=1,pX     !loop on each x row
+    do j=1,pY     !loop on each y line
+    
+    
+    
+      !fill the B vector
+      do k=1,pZ-1
+	b(k) = ForceField(i,j,k,3) -2.0d0*ForceField(i,j,k+1,3) + ForceField(i,j,k+2,3)    !ONLY THE Y COMPONENT OF THE FIELD!!!
+      enddo
+      b=6.0d0*b/(hz**2)
+      
+      !reset the tridiagonal matrix
+      diag=4.0d0      
+      ld=1.0d0
+      ud=1.0d0
+      
+      call dgtsl((pZ-1), ld, diag, ud, b, info)   !solve the tridiag linear system
+      
+      !set the spline coeffs in a matrix
+      do k=1,pZ-1
+	ZSpline(i,j,k+1)=b(k)
+      enddo    
+    
+    enddo
+  enddo
+  !now we have the M parameters for all the Y lines to build the splines (ONLY FOR THE Y COMPONENT OF THE FIELD!!!
+
+  write(*,*)'done'
+
+
+end subroutine ZSplineSetup
+
+
+!*** ****** Full 4D NURBS interpolation ****** ***!
+!   If this works i want double salary!
+!
+subroutine NURBSSetup()
+  implicit none
+  integer :: i,j,k,ii,jj,kk
+  double precision :: x(3),f(3)
+  
+  !write(*,*)'points:',px,py,pz
+  !write(*,*)ForceField(1,1,:,3)
+  
+  !*** create the parameters vectors
+  allocate(usk(pX+1))     !there is one more point... itz the periodic image of the first one!
+  call NURBSParams(usk,pX+1)
+  allocate(vsk(pY+1))     !there is one more point... itz the periodic image of the first one!
+  call NURBSParams(vsk,pY+1)
+  allocate(wsk(pZ))
+  call NURBSParams(wsk,pZ)
+  
+  !*** compute the knot vectors
+  allocate(uk(pX+2+Order))
+  call NURBSKnots(uk,usk,pX+1,pX+2+Order)
+  allocate(vk(pY+2+Order))
+  call NURBSKnots(vk,vsk,pY+1,pY+2+Order)
+  allocate(wk(pZ+1+Order))
+  call NURBSKnots(wk,wsk,pZ,pZ+1+Order)
+  
+  allocate(Nb(0:Order))   !this will contain the non zero basis functions
+  allocate(Nb3(3,0:Order))
+  
+  write(*,'(A)',advance='no')'Computing NURBS control points... '
+  call NURBS_FirstSys()
+  write(*,'(A)')'done!'
+
+end subroutine NURBSSetup
+
+
+
+subroutine NURBS_FirstSys()
+  implicit none
+  double precision, allocatable :: linsys(:,:),mat(:,:),b(:),IPIV(:)
+  
+  double precision :: Rxjk(pX+1,pY+1,pZ,3),Rxyk(pX+1,pY+1,pZ,3)
+  integer :: i,j,k,ii,jj,kk,c,INFO
+  
+  Allocate(Pijk(pX+1,pY+1,pZ,3))
+  allocate(xcoords(pX+1),ycoords(pY+1),zcoords(pZ))
+  Pijk=0.0d0
+  Rxjk=0.0d0
+  Rxyk=0.0d0
+  xcoords=0.0d0
+  ycoords=0.0d0
+  zcoords=0.0d0
+  
+  ! do the procedure on x-lines
+  
+  !*** setup the matrix to solve the first linear system
+  allocate(linsys(pX+1,pX+1),mat(pX+1,pX+1))
+  allocate(b(pX+1),IPIV(pX+1))
+  IPIV=0.0d0
+  b=0.0d0
+  linsys=0.0d0
+  mat=0.0d0
+  do i=1,pX+1       !loop on the rows
+    ii=NURBSSpan(pX+1,usk(i),uk)    !find the span of usk(i)
+    call NURBSBasis(ii,usk(i),pX+1,uk)
+    do j=0,Order
+      linsys(i,ii-Order+j)=Nb(j)
+      mat(i,ii-Order+j)=Nb(j)
+    enddo
+  enddo
+  !*** the matrix is created, now create the b vector and solve the system
+  
+  !first compute the x positions of the pseudo control points
+  do i=1,pX
+    xcoords(i)=GridX(i)
+  enddo
+  xcoords(pX+1)=xMax
+  call DGESV( pX+1, 1, mat, pX+1, IPIV, xcoords, pX+1, INFO )
+
+  !*** since the grid is regular, at this point it doesnt matter
+  ! to compute y and z coords of the control points.
+  ! Only x coords and the force values fx fy fz
+  do c=1,3             !loop on force components
+    
+    do j=1,pY+1         !loop on y lines
+      jj=j
+      if(j==pY+1)  jj=1 !this uses the first line replicated
+      do k=1,pZ         !loop on each z position
+        
+        do i=1,pX
+          b(i)=ForceField(i,jj,k,c)
+        enddo
+        b(pX+1)=ForceField(1,jj,k,c)
+        
+        IPIV=0.0d0
+        INFO=0
+        mat=linsys    !reload the matrix
+        call DGESV( pX+1, 1, mat, pX+1, IPIV, b, pX+1, INFO )
+        Rxjk(1:pX+1,j,k,c)=b(1:pX+1)
+      enddo
+      
+    enddo
+    
+  enddo
+
+  deallocate(linsys, mat,b,IPIV)
+  
+  !y lines
+  
+  !*** setup the matrix to solve the first linear system
+  allocate(linsys(pY+1,pY+1),mat(pY+1,pY+1))
+  allocate(b(pY+1),IPIV(pY+1))
+  IPIV=0.0d0
+  b=0.0d0
+  linsys=0.0d0
+  mat=0.0d0
+  do i=1,pY+1       !loop on the rows
+    ii=NURBSSpan(pY+1,vsk(i),vk)    !find the span of usk(i)
+    call NURBSBasis(ii,vsk(i),pY+1,vk)
+    do j=0,Order
+      linsys(i,ii-Order+j)=Nb(j)
+      mat(i,ii-Order+j)=Nb(j)
+    enddo
+  enddo
+  do j=1,pY
+    ycoords(j)=GridY(j)
+  enddo
+  ycoords(pY+1)=yMax
+  call DGESV( pY+1, 1, mat, pY+1, IPIV, ycoords, pY+1, INFO )
+  do c=1,3             !loop on force components
+    
+    do i=1,pX+1         !loop on y lines
+      ii=i
+      if(i==pX+1)  ii=1 !this uses the first line replicated
+      do k=1,pZ         !loop on each z position
+        
+        do j=1,pY+1
+          b(j)=Rxjk(i,j,k,c)
+        enddo
+        
+        IPIV=0.0d0
+        INFO=0
+        mat=linsys    !reload the matrix
+        call DGESV( pY+1, 1, mat, pY+1, IPIV, b, pY+1, INFO )
+        Rxyk(i,1:pY+1,k,c)=b(1:pY+1)
+      enddo
+      
+    enddo
+    
+  enddo
+  
+  deallocate(linsys, mat,b,IPIV)
+  
+  !z lines
+  
+  !*** setup the matrix to solve the first linear system
+  allocate(linsys(pZ,pZ),mat(pZ,pZ))
+  allocate(b(pZ),IPIV(pZ))
+  IPIV=0.0d0
+  b=0.0d0
+  linsys=0.0d0
+  mat=0.0d0
+  do i=1,pZ       !loop on the rows
+    ii=NURBSSpan(pZ,wsk(i),wk)    !find the span of usk(i)
+    call NURBSBasis(ii,wsk(i),pZ,wk)
+    do j=0,Order
+      linsys(i,ii-Order+j)=Nb(j)
+      mat(i,ii-Order+j)=Nb(j)
+    enddo
+  enddo
+  do j=1,pZ
+    zcoords(j)=GridZ(j)
+  enddo
+  call DGESV( pZ, 1, mat, pZ, IPIV, ycoords, pZ, INFO )
+  do c=1,3             !loop on force components
+    
+    do i=1,pX+1         !loop on y lines
+      do j=1,pY+1         !loop on each z position
+        
+        do k=1,pZ
+          b(k)=Rxyk(i,j,k,c)
+        enddo
+        
+        IPIV=0.0d0
+        INFO=0
+        mat=linsys    !reload the matrix
+        call DGESV( pZ, 1, mat, pZ, IPIV, b, pZ, INFO )
+        Pijk(i,j,1:pZ,c)=b(1:pZ)
+      enddo
+      
+    enddo
+    
+  enddo
+  
+  
+end subroutine NURBS_FirstSys
+
+
+subroutine NURBSBasis(ii,t,n,ukv)
+  implicit none
+  integer :: ii
+  integer, intent(in) :: n
+  double precision, intent(in) :: t
+  double precision, intent(in) :: ukv(n+Order+1)
+  double precision :: left(0:Order),right(0:Order),saved,temp
+  integer :: j,r
+  
+  left=0.0d0
+  right=0.0d0
+  Nb=0.0d0
+  Nb(0)=1.0d0
+
+  if(ii==n+1) ii=ii-1       !this correct the case t=1
+  
+  do j=1,Order
+    left(j)=t-ukv(ii-j+1)
+    right(j)= ukv(ii+j)-t
+    saved=0.0d0
+    do r=0,j-1
+      temp=Nb(r)/(right(r+1)+left(j-r))
+      Nb(r)=saved+right(r+1)*temp
+      saved=left(j-r)*temp
+    enddo
+    Nb(j)=saved
+  enddo
+  
+end subroutine NURBSBasis
+
+
+subroutine NURBSFullBasis(t,idx)
+  implicit none
+  double precision, intent(in) :: t(3)
+  integer, intent(out):: idx(3)
+  integer :: i
+  
+  idx(1)=NURBSSpan(pX+1,t(1),uk)
+  idx(2)=NURBSSpan(pY+1,t(2),vk)
+  idx(3)=NURBSSpan(pZ,t(3),wk)
+  
+  !set the non zero basis functions in t
+  call NURBSBasis(idx(1),t(1),pX+1,uk)
+  Nb3(1,0:Order)=Nb(0:Order)
+  call NURBSBasis(idx(2),t(2),pY+1,vk)
+  Nb3(2,0:Order)=Nb(0:Order)
+  call NURBSBasis(idx(3),t(3),pZ,wk)
+  Nb3(3,0:Order)=Nb(0:Order)
+  
+end subroutine NURBSFullBasis
+
+double precision function NURBSxyz(t,xyz,rebase)
+  implicit none
+  integer, intent(in) :: xyz
+  logical, intent(in) :: rebase
+  double precision, intent(in) :: t(3)
+  integer :: idx(3),i,j,k
+  double precision :: si,sj,sk
+  
+  if(rebase)  then
+    call NURBSFullBasis(t,idx)
+  else
+    idx(1)=NURBSSpan(pX+1,t(1),uk)
+    idx(2)=NURBSSpan(pY+1,t(2),vk)
+    idx(3)=NURBSSpan(pZ,t(3),wk)
+  endif
+  si=0.0d0
+  select case (xyz)
+  case (1)
+    if(t(1)==1.0d0) idx(1)=idx(1)-1
+    do i=0,Order
+      sj=0.0d0
+      do j=0,Order
+        sk=0.0d0
+        do k=0,Order
+          sk=sk+Nb3(3,k)*xcoords(idx(1)-Order+i)
+        enddo
+        sj=sj+Nb3(2,j)*sk
+      enddo
+      si=si+Nb3(1,i)*sj
+    enddo
+    NURBSxyz=si
+    goto 10
+  case (2)
+    if(t(2)==1.0d0) idx(2)=idx(2)-1
+    do i=0,Order
+      sj=0.0d0
+      do j=0,Order
+        sk=0.0d0
+        do k=0,Order
+          sk=sk+Nb3(3,k)*ycoords(idx(2)-Order+j)
+        enddo
+        sj=sj+Nb3(2,j)*sk
+      enddo
+      si=si+Nb3(1,i)*sj
+    enddo
+    NURBSxyz=si
+    goto 10
+  case (3)
+    if(t(3)==1.0d0) idx(3)=idx(3)-1
+    
+    do i=0,Order
+      sj=0.0d0
+      do j=0,Order
+        sk=0.0d0
+        do k=0,Order
+          sk=sk+Nb3(3,k)*zcoords(idx(3)-Order+k)
+        enddo
+        sj=sj+Nb3(2,j)*sk
+      enddo
+      si=si+Nb3(1,i)*sj
+    enddo 
+    NURBSxyz=si
+    goto 10
+  end select
+  
+10 return
+  
+end function NURBSxyz
+
+
+!*** ****** Create a knot vector ****** ***!
+!   Input variables:
+!   (INT)n             dimension of usk - number of points
+!   (INT)m             dimension of uk - m=n+p+1
+!   (INT)p             degree of the NURBS
+!   (DBL)uk(m)         empty knot vector (dimension m should be n+p+1)
+!   (DBL)usk(n)        parameters vector of dimension n
+!
+!   Output variables:
+!   DBL)uk(m)          the cool knot vector!
+!
+!   Description:
+!   generates a knot vector by averaging the parameter vector.
+!
+subroutine NURBSKnots(ukv,uskv,n,m)
+  implicit none
+  integer, intent(in) :: n,m
+  double precision :: ukv(m),uskv(n)
+  integer :: i
+  
+  do i=1,Order+1
+    ukv(i)=0.0d0
+  enddo
+  do i=m-Order,m
+    ukv(i)=1.0d0
+  enddo
+  do i=1,n-Order-1
+    ukv(i+Order+1)=sum(uskv(i+1:i+Order))/dble(Order)
+  enddo
+  
+end subroutine NURBSKnots
+
+
+!*** ****** Create Parameters Vector equally spaced!! ****** ***!
+!   Input variables:
+!   (INT)n             dimension of u - number of points
+!   (DBL)u(n)          enpty parameters vector of dimension n
+!
+!   Output variables:
+!   DBL)u(n)          the cool parameters vector!
+!
+!   Description:
+!   generates a parameters vector using the equally spaced method.
+!
+subroutine NURBSParams(u,n)
+  implicit none
+  integer, intent(in) :: n
+  double precision,intent(inout) :: u(n)
+  integer :: i
+  
+  !*** create the parameters vectors - Equally spaced method
+  u(1)=0.0d0
+  do i=2,n-1
+    u(i)=dble(i-1)/dble(n-1)
+  end do
+  u(n)=1.0d0
+  
+end subroutine NURBSParams
+
+
+!*** ****** Find the knot span ****** ***!
+!
+integer function NURBSSpan(n,t,ukv)
+  implicit none
+  integer, intent(in) :: n
+  double precision, intent(in) :: t
+  double precision, intent(in) :: ukv(n+Order+1)
+  integer :: low, mid, hig
+  
+!   if(t==0.0d0) then
+!     NURBSSpan=Order+1
+!     return
+!   endif
+  if(t==ukv(n+2)) then
+    NURBSSpan=n+1
+    return
+  endif
+  
+  low=Order+1
+  hig=n+2
+  mid=(low+hig)/2
+  do
+    
+    if((t>=ukv(mid)).and.(t<ukv(mid+1))) then
+      NURBSSpan=mid
+      exit
+    endif
+    
+    if(t<ukv(mid)) then
+      hig=mid
+    else
+      low=mid
+    endif
+    mid=(low+hig)/2
+  enddo
+  
+  
+end function NURBSSpan
+
+
+!*** ****** reads the gridfile ****** ***!
+subroutine ReadGridFile()
+  implicit none
+  integer :: idx,ifile=999
+  character*256 :: line,tmpstr,strv
+  
+  GridFile=trim(ADJUSTL(GridFile))
+  
+  open(file=GridFile, unit=ifile)
+  write(*,*)'reading grid file: ' // GridFile
+  
+  rewind(ifile)
+  call find_str(ifile,'gridunits',idx,line)
+  if(line/='000') then
+    read(line,'(A9 A20)')tmpstr,strv
+    strv=trim(adjustl(strv))
+    if(strv=='ang') then
+      GridFactor=1.0e-10
+      write(*,*)'Grid parameters are in Angstroms.' 
+    endif
+      
+    if(strv=='uni') GridFactor=1.0d0
+  endif
+  
+  !*** read the geometric parameters **************
+  rewind(ifile)  
+  call find_str(ifile,'geometry',idx,line)
+  if(line/='000') then
+    read(line,'(A8 A)')tmpstr,strv
+    if(trim(adjustl(strv))=='step') then
+      write(*,'(A)',advance='no')'Surface with a step at point: '
+      rewind(ifile)  
+      call find_str(ifile,'stepYpoint',idx,line)
+      if(line/='000') then
+        read(line,'(A10 F14.8)')tmpstr,StepYPoint
+        write(*,*)StepYPoint*GridFactor
+        Geometry=2
+      else
+        write(*,'(A)')'unable to find the step Y gridpoint! Check your input!'
+        stop
+      endif
+      write(*,'(A)',advance='no')'Step height: '
+      rewind(ifile)  
+      call find_str(ifile,'stepheight',idx,line)
+      if(line/='000') then
+        read(line,'(A10 F14.8)')tmpstr,StepHeight
+        write(*,*)StepHeight*GridFactor
+      else
+        write(*,'(A)')'unable to find the step height! Check your input!'
+        stop
+      endif  
+      write(*,'(A)',advance='no')'Step broadening: '
+      rewind(ifile)  
+      call find_str(ifile,'stepbroad',idx,line)
+      if(line/='000') then
+        read(line,'(A9 F14.8)')tmpstr,StepBroad
+        write(*,*)StepBroad*GridFactor
+      else
+        write(*,'(A)')'unable to find the step width! Check your input!'
+        stop
+      endif
+      
+    else if(trim(adjustl(strv))=='unity') then
+      write(*,'(A)')'Plain surface geometry.'
+      Geometry=1
+    else
+      write(*,'(A)')'Unrecognized surface geometry. Use step or unit!'
+      stop
+    endif
+    
+  endif
+  !************************************************
+  
+  
+  !*** read the grid size *************************
+  rewind(ifile)  
+  call find_str(ifile,'x.gridpoints',idx,line)
+  if(line/='000') then
+    read(line,'(A12 I8)')tmpstr,pX
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'y.gridpoints',idx,line)
+  if(line/='000') then
+    read(line,'(A12 I8)')tmpstr,pY
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'z.gridpoints',idx,line)
+  if(line/='000') then
+    read(line,'(A12 I8)')tmpstr,pZ
+  endif    
+  !************************************************
+  
+  !*** read the grid min vals *********************
+  rewind(ifile)  
+  call find_str(ifile,'x.gridMin',idx,line)
+  if(line/='000') then
+    read(line,'(A9 F14.8)')tmpstr,xMin
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'y.gridMin',idx,line)
+  if(line/='000') then
+    read(line,'(A9 F14.8)')tmpstr,yMin
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'z.gridMin',idx,line)
+  if(line/='000') then
+    read(line,'(A9 F14.8)')tmpstr,zMin
+  endif    
+  !************************************************
+  
+  !*** read the grid Max vals *********************
+  rewind(ifile)  
+  call find_str(ifile,'x.gridMax',idx,line)
+  if(line/='000') then
+    read(line,'(A9 F14.8)')tmpstr,xMax
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'y.gridMax',idx,line)
+  if(line/='000') then
+    read(line,'(A9 F14.8)')tmpstr,yMax
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'z.gridMax',idx,line)
+  if(line/='000') then
+    read(line,'(A9 F14.8)')tmpstr,zMax
+  endif    
+  !************************************************
+  
+  !*** read the grid symmetry *********************
+  rewind(ifile)  
+  call find_str(ifile,'x.symmetry',idx,line)
+  if(line/='000') then
+    read(line,'(A10 A)')tmpstr,strv
+    if(trim(adjustl(strv))=='mirror')then
+      xsymmetry=2
+    else
+      xsymmetry=1
+    endif
+  endif  
+  rewind(ifile)  
+  call find_str(ifile,'y.symmetry',idx,line)
+  if(line/='000') then
+    read(line,'(A10 A)')tmpstr,strv
+    if(trim(adjustl(strv))=='mirror')then
+      ysymmetry=2
+    else
+      ysymmetry=1
+    endif
+  endif  
+  !************************************************
+  
+  !*** Multiply everything by GridFactor **********
+  xMin=xMin*GridFactor
+  yMin=yMin*GridFactor
+  zMin=zMin*GridFactor
+  
+  xMax=xMax*GridFactor
+  yMax=yMax*GridFactor
+  zMax=zMax*GridFactor
+  
+  StepYPoint=StepYPoint*GridFactor
+  StepHeight=StepHeight*GridFactor
+  StepBroad=StepBroad*GridFactor
+  !************************************************
+    
+  close(ifile)
+  
+end subroutine ReadGridFile
+
+
+!*** generate the grid points from the input parameters
+subroutine GenerateRegularGrid()
+  implicit none
+  integer :: cnt
+  double precision :: asd
+  
+  write(*,*)'Generating grid points...'
+  
+  allocate(gridX(pX))
+  allocate(gridY(pY))
+  allocate(gridZ(pZ))
+  
+  hx=(xMax-xMin)/dble(pX)
+  hy=(yMax-yMin)/dble(pY)
+  hz=(zMax-zMin)/dble(pZ)
+  
+  do cnt=1,pX
+    gridX(cnt)=xMin+(cnt-1)*hx
+  enddo
+  do cnt=1,pY
+    gridY(cnt)=yMin+(cnt-1)*hy
+  enddo
+  do cnt=1,pZ
+    gridZ(cnt)=zMin+(cnt-1)*hz
+  enddo 
+  
+  open(file="grid.out",unit=131)
+  write(131,*)'Generated Grid'
+  write(131,*)'xPoints:'
+  write(131,*)gridX
+  write(131,*)'yPoints:'
+  write(131,*)gridY
+  write(131,*)'zPoints:'
+  write(131,*)gridZ 
+  close(131)
+  
+  write(*,*)'Grid generated (grid.out)'
+  
+end subroutine GenerateRegularGrid
+
+
+!*** ****** read the force field ****** ***!
+subroutine ReadForceField()
+  implicit none
+  integer :: ifile=999, ciph=1
+  integer :: i,j,k,q
+  character*40 :: frmt,dfrmt
+  double precision, allocatable :: tmpArr(:)
+  
+  ForceFile=trim(adjustl(ForceFile))
+  allocate(ForceField(pX,pY,pZ+1,3))  !the is one more z-plane where all the forces are 0!!!
+  allocate(tmpArr(pX))
+  ForceField=0.0d0
+  
+  write(*,*) 'Reading the forcefield from ' // ForceFile
+  
+  if(pX>=10) ciph=2
+  if(pX>=100) ciph=3
+  if(pX>=1000) ciph=4
+  if(pX>=10000) then 
+    write(*,*) 'The grid is kinda too much for me :('
+    stop
+  endif
+  
+  !*** setup the format string
+  write(dfrmt,*)pX
+  dfrmt=trim(adjustl(dfrmt))
+  frmt='(' // dfrmt(1:ciph) // '(E16.8))'
+    
+  open(file=ForceFile,unit=ifile)
+  q=0
+  do k=1,pZ
+    do j=1,pY
+      
+      read(ifile,frmt)tmpArr          !read an x line of the forcefield and store it in the unformatted array
+      ForceField(1:pX,j,k,1)=tmpArr(1:pX)
+      read(ifile,frmt)tmpArr          !read an x line of the forcefield and store it in the unformatted array
+      ForceField(1:pX,j,k,2)=tmpArr(1:pX)
+      read(ifile,frmt)tmpArr          !read an x line of the forcefield and store it in the unformatted array
+      ForceField(1:pX,j,k,3)=tmpArr(1:pX)
+      q=q+3
+      
+    enddo
+  enddo
+  
+  close(ifile)
+  
+end subroutine ReadForceField
+
+!*** ****** Read the ForceField File ****** ***!
+!   Description:
+!   this routine reads the forcefield input file when it is written in the
+!   simple plain form. The first 3 columns are the matrix indexes of the gridpoints
+!   and the last 3 are the force components. Very straightforward.
+!
+subroutine ReadForceFieldSimple()
+  implicit none
+  integer :: ifile=999, ciph=1
+  integer :: i,j,k
+  character*200 :: line
+  double precision :: fx,fy,fz
+  
+  
+  ForceFile=trim(adjustl(ForceFile))
+  allocate(ForceField(pX,pY,pZ+1,3))  !the is one more z-plane where all the forces are 0!!!
+  ForceField=0.0d0
+
+  open(file=ForceFile,unit=ifile)
+  
+  10  read(ifile, '(A)', end=20) line                !read a line
+      read(line,*)i,j,k,fx,fy,fz                     !read the data in that line
+      !read(line,*)j,i,k,fx,fy,fz
+      ForceField(i,j,k,1)=fx
+      ForceField(i,j,k,2)=fy                         !set the forcefield matrix
+      ForceField(i,j,k,3)=fz
+      
+      goto 10                             !loop!
+      
+  20  close(ifile)      !the end of the file was reached!
+      return
+  
+  
+end subroutine ReadForceFieldSimple
+
+subroutine writeLateralMap(height)
+  use consts
+  implicit none
+  double precision, intent(in) :: height
+  double precision :: x,y,pos(3),f(3),f2(3),grd,pos2(3),pos3(3),f3(3)
+  integer :: i,j
+  
+  
+  !write the 2D force map and the gradient at fixed height
+  pos=0.0d0
+  pos(3)=height
+  do x=0.0d0, 6.7e-10, 0.705e-10/4.0d0
+    do y=0.0d0, 6.7e-10, 0.705e-10/4.0d0
+      pos(1)=x
+      pos(2)=y
+      call CalcForce(pos,f)
+      !call SplineYGrad(pos,grd)
+      write(772,*)x,y,f(2)!,grd
+    enddo
+    write(772,*)
+  enddo
+  
+  !write some force lines
+  pos(1)=GridX(4)
+  pos2=pos
+  pos3=pos
+  pos2(1)=GridX(5)
+  pos3(1)=GridX(4)+0.705e-10/2.0d0
+  
+  do y=0.0d0, 2*5.65e-10, 0.705e-10/8.0d0
+    pos(2)=y
+    pos2(2)=y
+    pos3(2)=y
+    call CalcForce(pos,f)
+    call CalcForce(pos2,f2)
+    call CalcForce(pos3,f3)
+    !write(*,*)pos3-pos2
+    write(123,*)y,f(2),f2(2),f3(2)
+    
+  enddo
+  
+  !write the given field
+  
+  do j=1,pY
+    write(234,*)GridY(j),ForceField(4,j,50,2),ForceField(5,j,50,2)
+  enddo
+    do j=1,pY
+    write(234,*)GridY(j)+5.64e-10,ForceField(4,j,50,2),ForceField(5,j,50,2)
+  enddo
+  
+end subroutine writeLateralMap
+
+subroutine SetInterpol()
+  implicit none
+  
+  write(*,*) 'The force field were loaded into the matrix.'
+  write(*,'(A)',advance='no')' Interpolation method:'
+  if(InterpolMethod==1) then
+    write(*,*)'trilinear'
+    call TrilinearSetup()
+  endif
+
+  if(InterpolMethod==2) then
+    write(*,*)'smart yz splines / bilinear'
+    call YSplineSetup()
+    call ZSplineSetup()
+  endif
+  
+  if(InterpolMethod==3) then
+    write(*,*)'Full NURBS'
+    call NURBSSetup()
+  endif
+
+  
+  write(*,*)
+
+end subroutine SetInterpol
+
+
+!*** this is the same routine found in input.f90
+subroutine find_str(fnum,str,idx,line)
+  implicit none
+  integer, intent(in) :: fnum         !file number
+  character*8, intent(in) :: str      !string to find (itz always 8 characters!!!
+  integer, intent(out) :: idx         !character index in 'line'
+  character*256, intent(out):: line   !Line containing 'str'
+  
+  
+  10  read(fnum, '(A)', end=20) line                !read a line
+      !write(*,*)line
+      idx = index (line, str)                       !look for the string
+  
+      if ((idx .ne. 0) .and. (line(1:1)/='#')) then !if the string is present...
+	return                                      !exit the subroutine
+      endif                                         !***
+      goto 10                             !loop!
+      
+  20  line='000'                    !the end of the file was reached!
+      return
+
+
+end subroutine find_str
+
+
+
+subroutine dbgLine()
+  implicit none
+  integer :: i,j,k,idx(3)
+  double precision :: force(3),x(3),xx
+
+  x=0.0d0
+  !x(2)=0.30e-10
+  !x(3)=5.0e-10
+  
+  do xx=3.00e-10 ,20.0e-10, 0.01e-10
+    x(3)=xx
+    !write(*,*)'trilinearing',x(:)
+    call Trilinear(x,force)
+    !call FindIndex(x,idx)
+    
+    write(90,*)xx, force(:)   !TrilinXline(idx(1),idx(2),idx(3),1,1)*x(1) + TrilinXline(idx(1),idx(2),idx(3),1,2)
+    !write(*,*)xx,'index is',idx
+    
+  enddo
+    
+  write(*,*) 'done1'
+  
+  !write the original points
+  x(2)=0.0d0
+  do i=1,pZ
+    x(3)=gridZ(i)
+    !write(*,*)'trilinearing',x(:)
+    call Trilinear(x,force)
+    !write(93,*)x(1),force(:)
+    write(91,*)gridZ(i),ForceField(1,1,i,:)
+    write(92,*)gridZ(i),ForceField(1,2,i,:)
+  enddo
+
+
+end subroutine dbgLine
+
+
+subroutine dbgzspl()
+  implicit none
+  integer :: i,j,k,idx(3)
+  double precision :: force,x(3),xx
+
+  x=0.0d0
+  x(3)=1.0e-10
+  !x(2)=0.3e-10
+  do xx=0.0d0 , 30.0e-10, 0.01e-10
+    x(2)=xx
+    call SplineZ(x,force)
+    write(93,*)xx,force
+  enddo
+  
+  do i=1,pY!pZ+1
+    x(3)=gridY(i)
+    write(90,*)gridY(i),ForceField(1,i,10,3)
+    write(91,*)gridY(i),ForceField(1,i,10,3)
+  enddo
+
+  write(*,*)zmax,hz
+
+end subroutine dbgzspl
+
+subroutine dbgyspl()
+  implicit none
+  integer :: i,j,k
+  double precision :: force,x(3),xx
+
+  x=0.0d0
+  x(3)=5.0e-10
+  !x(2)=0.3e-10
+  do xx=0.0d0 , 2.28e-9, 0.05e-10
+    x(2)=xx
+    call SplineY(x,force)
+    write(93,*)xx,force
+  enddo
+  
+  do i=1,pY
+    x(3)=gridZ(i)
+    write(90,*)gridY(i),ForceField(1,i,20,2)
+    write(91,*)gridY(i),ForceField(1,i,21,2)
+  enddo
+
+  !write(*,*)zmax,hz
+
+end subroutine dbgyspl
+
+
+subroutine dbg2dy()
+  implicit none
+  integer :: i,j,k
+  double precision :: x,y,fy
+  double precision :: p(3)
+
+  p=0.0d0
+  p(3)=3.5e-10
+  
+  do x=0.0d0,5.64e-10,0.5e-10
+    do y=0.0d0, 28.20e-10, 0.5e-10
+      p(1)=x
+      p(2)=y
+      call SplineY(p,fy)
+      write(95,*)x,y,fy
+    enddo
+    write(95,*)
+  enddo
+  
+end subroutine dbg2dy
+
+
+!*** ****** tridiagonal system solver from LINPACK ****** ***!
+subroutine dgtsl ( n, c, d, e, b, info )
+
+!*****************************************************************************80
+!
+!! DGTSL solves a general tridiagonal linear system.
+!
+!  Modified:
+!
+!    17 May 2005
+!
+!  Author:
+!
+!    FORTRAN90 translation by John Burkardt.
+!
+!  Reference:
+!
+!    Jack Dongarra, Jim Bunch, Cleve Moler, Pete Stewart,
+!    LINPACK User's Guide,
+!    SIAM, 1979,
+!    ISBN13: 978-0-898711-72-1,
+!    LC: QA214.L56.
+!
+!  Parameters:
+!
+!    Input, integer N, the order of the tridiagonal matrix.
+!
+!    Input/output, real ( kind = 8 ) C(N), contains the subdiagonal of the
+!    tridiagonal matrix in entries C(2:N).  On output, C is destroyed.
+!
+!    Input/output, real ( kind = 8 ) D(N).  On input, the diagonal of the
+!    matrix.  On output, D is destroyed.
+!
+!    Input/output, real ( kind = 8 ) E(N), contains the superdiagonal of the
+!    tridiagonal matrix in entries E(1:N-1).  On output E is destroyed.
+!
+!    Input/output, real ( kind = 8 ) B(N).  On input, the right hand side.
+!    On output, the solution.
+!
+!    Output, integer INFO, error flag.
+!    0, normal value.
+!    K, the K-th element of the diagonal becomes exactly zero.  The 
+!       subroutine returns if this error condition is detected.
+!
+  implicit none
+
+  integer n
+
+  real ( kind = 8 ) b(n)
+  real ( kind = 8 ) c(n)
+  real ( kind = 8 ) d(n)
+  real ( kind = 8 ) e(n)
+  integer info
+  integer k
+  real ( kind = 8 ) t
+
+  info = 0
+  c(1) = d(1)
+
+  if ( 2 <= n ) then
+
+    d(1) = e(1)
+    e(1) = 0.0D+00
+    e(n) = 0.0D+00
+
+    do k = 1, n - 1
+!
+!  Find the larger of the two rows.
+!
+      if ( abs ( c(k) ) <= abs ( c(k+1) ) ) then
+!
+!  Interchange rows.
+!
+        t = c(k+1)
+        c(k+1) = c(k)
+        c(k) = t
+
+        t = d(k+1)
+        d(k+1) = d(k)
+        d(k) = t
+
+        t = e(k+1)
+        e(k+1) = e(k)
+        e(k) = t
+
+        t = b(k+1)
+        b(k+1) = b(k)
+        b(k) = t
+
+      end if
+!
+!  Zero elements.
+!
+      if ( c(k) == 0.0D+00 ) then
+        info = k
+        return
+      end if
+
+      t = -c(k+1) / c(k)
+      c(k+1) = d(k+1) + t * d(k)
+      d(k+1) = e(k+1) + t * e(k)
+      e(k+1) = 0.0D+00
+      b(k+1) = b(k+1) + t * b(k)
+
+    end do
+
+  end if
+
+  if ( c(n) == 0.0D+00 ) then
+    info = n
+    return
+  end if
+!
+!  Back solve.
+!
+  b(n) = b(n) / c(n)
+
+  if ( 1 < n ) then
+
+    b(n-1) = ( b(n-1) - d(n-1) * b(n) ) / c(n-1)
+
+    do k = n-2, 1, -1
+      b(k) = ( b(k) - d(k) * b(k+1) - e(k) * b(k+2) ) / c(k)
+    end do
+
+  end if
+
+  return
+end subroutine dgtsl
+
+
+subroutine SetForceNoise()
+  use consts
+  use cantilever
+  use timer
+  implicit none
+  
+  !set noise for fz
+      
+  SDF_z=dsqrt(4.d0*kB*Temp*k_z/(Q1*w1)/tstep)!/mass
+  SDF_y=dsqrt(4.d0*kB*Temp*k_y/(Q2*w2)/tstep)!/masstr
+  
+end subroutine SetForceNoise
+
+subroutine FillRndVector()
+  use ziggurat
+  implicit none
+  integer :: i
+
+  do i=1,RNDlen
+    RNDv(i)=rnor()
+  enddo
+
+  return
+
+end subroutine FillRndVector
+
+
+
+end module Forcer
+
+

@@ -1,0 +1,67 @@
+# Initial Tip Position
+holder.x  0.00e-10
+holder.y  0.00e-10
+
+# Cantilever/tip parameters
+# CLV.mass  0.0
+TIP.radi  1.32e-8
+TIP.angl  30.0
+TIP.hamk  0.25e-19
+
+z.CLV.F0  285441.48
+z.CLV.Kf  31.0
+z.CLV.Qf  31032.0
+
+y.CLV.F0  1481000.0
+y.CLV.Kf  2000.0
+y.CLV.Qf  176891.0
+
+# Oscillator switches
+z.oscill  .true.
+y.oscill  .false.
+
+# Amplitude Gain Control Parameters
+z.AGC.setpoint 15.0e-9
+z.AGC.offset  0.48E-11
+z.AGC.KP  0.030
+z.AGC.KI  0.450
+z.AGC.nf  2
+z.AGC.fc  200.0
+
+z.AGC.Re  5.00e-12
+z.AGC.Rt  0.05
+
+y.AGC.setpoint 0.20e-10
+y.AGC.offset 1.0E-14
+y.AGC.KP  0.8e-1
+y.AGC.KI  5.0
+y.AGC.nf  2
+y.AGC.fc  80.0
+
+y.AGC.Re  2.0e-12
+
+
+# Phase Locked Loop Parameters/Freq Detector
+nfilterz  2
+z.PLL.fc  200.0
+
+nfiltery  3
+y.PLL.fc  200.0
+
+# Automatic Distance Control Parameters
+z.ADC.Zi        40.0e-9
+z.ADC.Zf        15.25e-9
+z.ADC.dF        -400.0
+z.ADC.zLim      1.5e-10
+
+# leave the Landing time to 0.0 to use the ADC approach
+z.ADC.LandTime  0.80
+
+z.ADC.KP  1.00e-13
+z.ADC.KI  1.00e-10
+
+z.ADC.Re  40.00
+z.ADC.Rt  0.1
+
+
+
