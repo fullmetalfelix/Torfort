@@ -1,0 +1,61 @@
+# Virtual TR-FFM input file
+
+workmode  image
+
+# Secondary Input Files Specification
+forcegrids  adam_grid.in
+forcefield  adam_ff_mg.in
+vmachine    adam_vafm.in
+
+
+ignoredissi  .true.
+s.SYS.DB  .false.
+s.timestep 1.00E-8
+s.ATtimestep 1.00E-9
+s.temperature 300.0
+s.forcenoise  .false.
+
+# input for scanliner
+sl.length   1.628e-9
+sl.points   1000
+
+# input for zspectrer
+zs.points   30
+zs.zstep    0.1e-10
+
+# input for imager
+image.ps  64
+image.pf  200
+image.side      1.628e-9
+image.mode      FMAFM
+image.pattern   lineline
+image.speed     10.0e-9
+image.rspeed    50.0e-8
+image.fastdir   y
+
+# Output Settings
+writepts  100000
+dump.ini   .true.
+dump.rel  .true.
+dump.lnd   .true.
+dump.fvs  .true.
+
+
+
+
+
+
+
+
+
+
+# Force spectroscopy stuff (todo)
+#FSP.AXIS  3
+FSP.FILE  24
+FSP.Ipos  1.00e-10
+FSP.Fpos  20.00e-9
+FSP.dpos  0.10e-10
+FSP.1pos  1.65e-10
+FSP.2pos  0.00000
+FSP.3pos  0.00000
+

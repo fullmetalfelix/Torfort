@@ -1,0 +1,35 @@
+gridunits     ang
+
+geometry      unity
+#stepYpoint    11.28
+#stepheight    2.82
+#stepbroad     0.05
+
+x.gridtype    regular
+x.gridpoints  8
+x.fgstep      0.705
+x.gridMin     0.0
+x.gridMax     5.64
+x.symmetry    pacman
+
+y.gridtype    regular
+y.gridpoints  8
+y.fgstep      0.705
+y.gridMin     0.0
+y.gridMax     5.64
+y.symmetry    pacman
+
+z.gridtype    regular
+z.gridpoints  200
+z.fgstep      0.1
+z.gridMin     0.1
+z.gridMax     20.1
+
+d.zgridpoints 26
+dmap.step     0.2
+dmap.zMin     3.00
+dmap.zMax     8.00
+dmap.ATup     8.00
+dmap.ATdw     3.00
+
+
